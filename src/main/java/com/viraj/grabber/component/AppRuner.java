@@ -5,6 +5,7 @@ import com.viraj.grabber.service.DataGrabProducerService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Component;
 
@@ -17,11 +18,14 @@ public class AppRuner implements CommandLineRunner {
 
 	private final DataGrabProducerService dataGrabProducerService;
 	private final DataGrabConsumerService dataGrabConsumerService;
+	private final int producerThreadsCount;
 
 	@Autowired
-	public AppRuner(DataGrabProducerService dataGrabProducerService, DataGrabConsumerService dataGrabConsumerService) {
+	public AppRuner(DataGrabProducerService dataGrabProducerService, DataGrabConsumerService dataGrabConsumerService,
+					@Qualifier("producerThreadsCount") int producerThreadsCount) {
 		this.dataGrabProducerService = dataGrabProducerService;
 		this.dataGrabConsumerService = dataGrabConsumerService;
+		this.producerThreadsCount = producerThreadsCount;
 	}
 
 	@Override
@@ -30,7 +34,7 @@ public class AppRuner implements CommandLineRunner {
 
 		dataGrabConsumerService.doAsync(999);
 
-		for (int i = 0; i < 500; ++i) {
+		for (int i = 0; i < producerThreadsCount; ++i) {
 			LOGGER.info("AppRunner Starting Async for thread {}", i);
 			dataGrabProducerService.doAsync();
 			Thread.sleep(TimeUnit.MILLISECONDS.toMillis(5));

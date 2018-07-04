@@ -6,8 +6,11 @@ import com.viraj.grabber.client.HttpClient;
 import com.viraj.grabber.client.exception.ApiException;
 import com.viraj.grabber.client.exception.MalformedResponseException;
 import com.viraj.grabber.client.response.UsageDataHttpResult;
+import com.viraj.grabber.model.Databag;
 import com.viraj.grabber.model.Tags;
 import com.viraj.grabber.model.UsageData;
+import org.joda.time.DateTime;
+import org.joda.time.Interval;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -28,7 +31,7 @@ public class DataGrabProducerService {
 	private static final Logger LOGGER = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 	private static final String URI_FORMAT = "http://localhost/nodes/%d/usage";
 	private volatile AtomicLong count = new AtomicLong();
-	private final Map<Long, UsageDataHttpResult> previousResults = new HashMap<>();
+	private final Map<Long, Databag> previousResults = new HashMap<>();
 	private final int nodesCount;
 	private final QueueService queueService;
 	private final int refreshInterval;
@@ -69,37 +72,32 @@ public class DataGrabProducerService {
 		return Optional.ofNullable(data);
 	}
 
-	private void sleep(Stopwatch sw, long nodeId, boolean success) throws InterruptedException {
-		long elapsedTime = sw.elapsed(TimeUnit.MILLISECONDS);
-		long refreshIntervalInMillis = refreshIntervalTimeUnit.toMillis(refreshInterval);
-
-		Tags.TagsBuilder bldr = Tags.builder()
-				.tag("nodeId", String.valueOf(nodeId))
-				.tag("success", String.valueOf(success));
-		metricRegistry.timer(bldr.build().toMetricName("stats.timer.fetchData"))
-				.update(elapsedTime, TimeUnit.MILLISECONDS);
-
-		if (elapsedTime == refreshIntervalInMillis) {
-			if(success) {
-				healthService.recordSuccessfulGrab(nodeId);
-			}
-			return;
-		} else if (elapsedTime > refreshIntervalInMillis) {
-			//Send additional delay alert timer
-			if(success) {
-				healthService.recordDelayedGrab(nodeId);
-			}
-			return;
-		}
-		if(success) {
-			healthService.recordSuccessfulGrab(nodeId);
-		}
-		Thread.sleep(refreshIntervalInMillis - elapsedTime);
-	}
-
 	private long getNextNodeId() {
 		long nextNodeId = (count.incrementAndGet() % nodesCount) + 1;
 		return nextNodeId;
+	}
+
+	private static final boolean DELAYED = true;
+	private static final boolean NOT_DELAYED = false;
+
+	private boolean isDelayed(DateTime prevResultsTime, long nodeId) throws InterruptedException {
+		if (prevResultsTime == null) {
+			return NOT_DELAYED;
+		}
+		DateTime currentTime = DateTime.now();
+		Interval interval = new Interval(prevResultsTime, currentTime);
+		long elapsedTime = interval.toDurationMillis();
+		long refreshIntervalInMillis = refreshIntervalTimeUnit.toMillis(refreshInterval);
+
+		if (elapsedTime > refreshIntervalInMillis) {
+			//Send additional delay alert timer
+			healthService.recordDelayedGrab(nodeId);
+			LOGGER.debug("Fetch Delayed {}", nodeId);
+			return DELAYED;
+		}
+		LOGGER.debug("Node Id {} Sleeping for {}", nodeId, (refreshIntervalInMillis - elapsedTime));
+		Thread.sleep(refreshIntervalInMillis - elapsedTime);
+		return NOT_DELAYED;
 	}
 
 
@@ -112,18 +110,22 @@ public class DataGrabProducerService {
 			boolean success = true;
 			long nodeId = getNextNodeId();
 			LOGGER.debug("nodeId = {}", nodeId);
-			URI uri = URI.create(String.format(URI_FORMAT, nodeId));
-			UsageDataHttpResult prevResult = previousResults.getOrDefault(nodeId, null);
+
+			Databag bag = previousResults.getOrDefault(nodeId, Databag.builder().uri(URI.create(String.format(URI_FORMAT, nodeId))).build());
+			UsageDataHttpResult prevResult = bag.getPreviousResult();
+
 			try {
-				Optional<UsageDataHttpResult> optionalUsageDataHttpResult = getUsageData(nodeId, uri);
+				isDelayed(bag.getPreviousFetchTime(), nodeId);
+				Optional<UsageDataHttpResult> optionalUsageDataHttpResult = getUsageData(nodeId, bag.getUri());
 				if (!optionalUsageDataHttpResult.isPresent()) {
 					success = false;
 					continue;
 				}
 				UsageDataHttpResult currentResult = optionalUsageDataHttpResult.get();
+				bag.updatePreviousResult(currentResult);
 				if (prevResult == null) {
 					success = true;
-					previousResults.put(nodeId, currentResult);
+					previousResults.put(nodeId, bag);
 					continue;
 				}
 
@@ -134,12 +136,19 @@ public class DataGrabProducerService {
 					continue;
 				}
 				queueService.add(optionalUsageData.get());
-				previousResults.put(nodeId, currentResult);
+				previousResults.put(nodeId, bag);
 			} catch (RuntimeException ex) {
 				LOGGER.error("Encountered runtime exception!!", ex);
 				success = false;
 			} finally {
-				sleep(sw, nodeId, success);
+				if (success) {
+					healthService.recordSuccessfulGrab(nodeId);
+				}
+				Tags.TagsBuilder bldr = Tags.builder()
+						.tag("nodeId", String.valueOf(nodeId))
+						.tag("success", String.valueOf(success));
+				metricRegistry.timer(bldr.build().toMetricName("stats.timer.fetchData"))
+						.update(sw.elapsed(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS);
 			}
 		}
 		LOGGER.info("DataGrabProducerService thread is stopping!");
